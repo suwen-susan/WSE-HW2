@@ -11,130 +11,158 @@
 
 namespace fs = std::filesystem;
 
+// 辅助函数：截取文本片段作为摘要
+// 处理特殊字符（tab, 换行符）避免破坏 TSV 格式
+inline std::string makeSnippet(const std::string& text, size_t maxLen = 60) {
+    std::string snippet;
+    snippet.reserve(maxLen);
+    
+    size_t count = 0;
+    for (unsigned char ch : text) {
+        if (count >= maxLen) break;
+        
+        // 将 tab 和换行符替换为空格
+        if (ch == '\t' || ch == '\n' || ch == '\r') {
+            if (!snippet.empty() && snippet.back() != ' ') {
+                snippet.push_back(' ');
+            }
+        } else if (ch >= 32 || ch == '\t') {  // 可打印字符
+            snippet.push_back(ch);
+            count++;
+        }
+    }
+    
+    // 去除尾部空格
+    while (!snippet.empty() && snippet.back() == ' ') {
+        snippet.pop_back();
+    }
+    
+    return snippet;
+}
 
 class IndexBuilder {
 private:
-    std::unordered_map<std::string, std::vector<Posting>> indexMap;
     uint32_t currentDocID;
     std::string outputDir;
-    size_t memoryLimit; // 内存限制（posting数量）
     int batchNumber;
     
-    // 文档ID到文档名的映射
+    // 文档表文件
     std::ofstream docTableFile;
     
+    // 扁平 posting 输出文件（分片滚动写）
+    std::ofstream postingsOut;
+    size_t partByteLimit;      // 每个分片的字节阈值
+    size_t bytesWrittenInPart; // 当前分片累计字节（粗略估算）
+    size_t linesWrittenInPart; // 当前分片累计行数
+    
+    // 打开新的 posting 分片文件
+    void openNewPart() {
+        if (postingsOut.is_open()) {
+            postingsOut.close();
+        }
+        std::string filename = outputDir + "/postings_part_" + std::to_string(batchNumber) + ".tsv";
+        postingsOut.open(filename, std::ios::out | std::ios::binary);
+        if (!postingsOut.is_open()) {
+            std::cerr << "Failed to open " << filename << std::endl;
+            exit(1);
+        }
+        bytesWrittenInPart = 0;
+        linesWrittenInPart = 0;
+        std::cout << "Opened " << filename << std::endl;
+    }
+    
+    // 检查并滚动到新分片
+    void rolloverIfNeeded() {
+        if (bytesWrittenInPart >= partByteLimit) {
+            std::cout << "Batch " << batchNumber << " written: " 
+                      << linesWrittenInPart << " postings (~" 
+                      << (bytesWrittenInPart / (1024*1024)) << " MB)" << std::endl;
+            batchNumber++;
+            openNewPart();
+        }
+    }
+    
 public:
-    IndexBuilder(const std::string& outDir, size_t memLimit = 1000000) 
-        : currentDocID(0), outputDir(outDir), memoryLimit(memLimit), batchNumber(0) {
+    IndexBuilder(const std::string& outDir, size_t partBytes = (size_t)2ULL * 1024 * 1024 * 1024) 
+        : currentDocID(0), outputDir(outDir), batchNumber(0),
+          partByteLimit(partBytes), bytesWrittenInPart(0), linesWrittenInPart(0) {
         
         // 创建输出目录
         fs::create_directories(outputDir);
         
         // 打开文档表文件
-        docTableFile.open(outputDir + "/doc_table.txt");
+        docTableFile.open(outputDir + "/doc_table.txt", std::ios::out | std::ios::binary);
+        if (!docTableFile.is_open()) {
+            std::cerr << "Failed to open doc_table.txt" << std::endl;
+            exit(1);
+        }
+        
+        // 打开第一个 posting 分片
+        openNewPart();
     }
     
     ~IndexBuilder() {
         if (docTableFile.is_open()) {
             docTableFile.close();
         }
+        if (postingsOut.is_open()) {
+            postingsOut.close();
+        }
     }
    
     // 解析单个文档
     void parseDocument(const std::string& docName, const std::string& content) {
         // 记录文档ID和文档名的映射
-        docTableFile << currentDocID << "\t" << docName << "\n";
+        // 格式：internalDocID \t originalDocID \t passage_snippet
+        std::string snippet = makeSnippet(content, 60);
+        docTableFile << currentDocID << "\t" << docName << "\t" << snippet << "\n";
         
         // 统计当前文档中每个term的频率
         std::unordered_map<std::string, uint32_t> termFreq;
-
-        std::string normalizedContent = normalize(content);
+        termFreq.reserve(256); // 预分配减少rehash
         
-        std::istringstream iss(normalizedContent);
-        std::string token;
-        
-        while (iss >> token) {
-            if (!token.empty() && token.length() > 1) { // 过滤单字符词
-                termFreq[token]++;
-            }
+        // 使用新的分词函数（保留所有词，包括数字、单字符、停用词）
+        for (const auto& token : tokenize_words(content)) {
+            termFreq[token]++;
         }
         
-        // 将term frequencies添加到索引中
-        for (const auto& [term, freq] : termFreq) {
-            indexMap[term].emplace_back(currentDocID, freq);
+        // 逐 posting 行写出：term<TAB>docID<TAB>tf
+        for (const auto& kv : termFreq) {
+            const std::string& term = kv.first;
+            uint32_t tf = kv.second;
+            
+            postingsOut << term << "\t" << currentDocID << "\t" << tf << "\n";
+            
+            // 粗略估算字节数（避免频繁调用 tellp 的系统开销）
+            // term + tab + docID(最多10位) + tab + tf(最多5位) + newline
+            bytesWrittenInPart += term.size() + 1 + 10 + 1 + 5 + 1;
+            linesWrittenInPart++;
         }
         
         currentDocID++;
         
-        // 检查内存使用，如果超过限制则写出到磁盘
-        size_t totalPostings = 0;
-        for (const auto& [term, postings] : indexMap) {
-            totalPostings += postings.size();
-        }
-        
-        if (totalPostings >= memoryLimit) {
-            flushToDisk();
-        }
-    }
-    
-    // 将内存中的索引写入中间文件
-    void flushToDisk() {
-        if (indexMap.empty()) return;
-        
-        std::cout << "Flushing batch " << batchNumber << " to disk..." << std::endl;
-        
-        // 准备排序的term-postings列表
-        std::vector<TermPostings> sortedIndex;
-        sortedIndex.reserve(indexMap.size());
-        
-        for (auto& [term, postings] : indexMap) {
-            // 对每个term的postings按docID排序
-            std::sort(postings.begin(), postings.end());
-            
-            TermPostings tp(term);
-            tp.postings = std::move(postings);
-            sortedIndex.push_back(std::move(tp));
-        }
-        
-        // 按term字典序排序
-        std::sort(sortedIndex.begin(), sortedIndex.end(), 
-                  [](const TermPostings& a, const TermPostings& b) {
-                      return a.term < b.term;
-                  });
-        
-        // 写入中间文件（文本格式，便于调试）
-        std::string filename = outputDir + "/intermediate_" + 
-                               std::to_string(batchNumber) + ".txt";
-        std::ofstream outFile(filename);
-        
-        for (const auto& tp : sortedIndex) {
-            size_t df = tp.postings.size();
-            outFile << tp.term << " " << df;;
-            for (const auto& posting : tp.postings) {
-                outFile << " " << posting.docID << ":" << posting.frequency;
-            }
-            outFile << "\n";
-        }
-        
-        outFile.close();
-        
-        std::cout << "Batch " << batchNumber << " written: " 
-                  << sortedIndex.size() << " terms" << std::endl;
-        
-        batchNumber++;
-        indexMap.clear();
+        // 检查是否需要滚动到新分片
+        rolloverIfNeeded();
     }
     
     // 处理完所有文档后的收尾工作
     void finalize() {
-        // 写出剩余的索引数据
-        if (!indexMap.empty()) {
-            flushToDisk();
+        // 关闭所有文件
+        if (postingsOut.is_open()) {
+            std::cout << "Batch " << batchNumber << " written: " 
+                      << linesWrittenInPart << " postings (~" 
+                      << (bytesWrittenInPart / (1024*1024)) << " MB)" << std::endl;
+            postingsOut.close();
+        }
+        if (docTableFile.is_open()) {
+            docTableFile.close();
         }
         
         std::cout << "\nIndexing complete!" << std::endl;
         std::cout << "Total documents processed: " << currentDocID << std::endl;
-        std::cout << "Total intermediate files: " << batchNumber << std::endl;
+        std::cout << "Total intermediate files: " << (batchNumber + 1) << std::endl;
+        std::cout << "\nNext step: Use msort to globally sort posting files:" << std::endl;
+        std::cout << "  Example: msort -t '\\t' -k 1,1 -k 2,2n postings_part_*.tsv > postings_sorted.tsv" << std::endl;
     }
     
     // 处理MS MARCO数据集格式：tsv文件 (docID \t passage)
@@ -172,20 +200,30 @@ public:
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cout << "Usage: " << argv[0] << " <input_file> <output_dir>" << std::endl;
+        std::cout << "Usage: " << argv[0] << " <input_file> <output_dir> [part_size_gb]" << std::endl;
         std::cout << "Example: " << argv[0] << " collection.tsv ./index_output" << std::endl;
+        std::cout << "         " << argv[0] << " collection.tsv ./index_output 4" << std::endl;
+        std::cout << "  part_size_gb: Size of each intermediate file in GB (default: 2)" << std::endl;
         return 1;
     }
     
     std::string inputFile = argv[1];
     std::string outputDir = argv[2];
     
-    std::cout << "Building inverted index..." << std::endl;
+    // 可选：从命令行指定分片大小（GB）
+    size_t partSizeGB = 2;
+    if (argc >= 4) {
+        partSizeGB = std::stoull(argv[3]);
+    }
+    size_t partBytes = partSizeGB * 1024ULL * 1024ULL * 1024ULL;
+    
+    std::cout << "Building inverted index (Phase 1: Indexing)..." << std::endl;
     std::cout << "Input: " << inputFile << std::endl;
     std::cout << "Output: " << outputDir << std::endl;
+    std::cout << "Part size: " << partSizeGB << " GB" << std::endl;
     
-    // 创建索引构建器（内存限制：100万个postings）
-    IndexBuilder builder(outputDir, 1000000);
+    // 创建索引构建器（分片大小可配置，默认2GB）
+    IndexBuilder builder(outputDir, partBytes);
     
     // 处理数据集
     builder.processMSMARCO(inputFile);

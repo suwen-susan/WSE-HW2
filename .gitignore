@@ -1,4 +1,19 @@
+# 数据文件
 data/
 output/
+index/
+
+# 可执行文件
 *.exe
+
+# 中间测试文件
+test_*.tsv
+test_output/
+test_index/
+*_sorted.tsv
+
+# IDE
 .vscode/
+
+# 旧版中间文件
+intermediate_*.txt

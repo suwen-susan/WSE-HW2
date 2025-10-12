@@ -1,54 +1,41 @@
 #include <string>
 #include <vector>
-#include <unordered_map>
-#include <fstream>
 #include <sstream>
 #include <algorithm>
 #include <cctype>
 
-
-// Posting结构
-struct Posting {
-    uint32_t docID;
-    uint32_t frequency;
-
-    Posting(uint32_t d, uint32_t f) : docID(d), frequency(f) {}
-    
-    bool operator<(const Posting& other) const {
-        return docID < other.docID;
-    }
-};
-
-// 词项和其postings
-struct TermPostings {
-    std::string term;
-    std::vector<Posting> postings;
-    
-    TermPostings(const std::string& t) : term(t) {}
-};
-
-// 文本预处理：转小写、去标点
+// 文本预处理：非字母数字统一视为分隔符；转小写；不做词干化
+// 符合课程建议：'-', ':', '.', ',', '(', ')', 等都是分隔符
 inline std::string normalize(const std::string& text) {
     std::string result;
-    for (char c : text) {
-        if (std::isalnum(static_cast<unsigned char>(c))) {
-            result.push_back(std::tolower(static_cast<unsigned char>(c)));
-        } else if (std::isspace(static_cast<unsigned char>(c))) {
-            result.push_back(' '); // 保留空格分词
+    result.reserve(text.size());
+    
+    auto push_space = [&]() {
+        if (!result.empty() && result.back() != ' ') {
+            result.push_back(' ');
+        }
+    };
+    
+    for (unsigned char uc : text) {
+        if (std::isalnum(uc)) {
+            result.push_back(std::tolower(uc));
+        } else {
+            // 任何非字母数字字符都是分隔符
+            push_space();
         }
     }
     return result;
 }
 
-// 分词
-inline std::vector<std::string> tokenize(const std::string& text) {
+// 分词：保留所有词（包括数字、单字符、停用词）
+// 符合课程建议：不过滤停用词、保留数字词如 "2"、"7up"、"smith007"
+inline std::vector<std::string> tokenize_words(const std::string& text) {
     std::vector<std::string> tokens;
     std::stringstream ss(normalize(text));
     std::string token;
     while (ss >> token) {
-        if (token.length() > 1) {  // 过滤单字符
-            tokens.push_back(token);
-        }
+        // 不做任何过滤，保留所有分割出的词
+        tokens.push_back(token);
     }
     return tokens;
 }
