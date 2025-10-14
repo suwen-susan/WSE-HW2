@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>C++ 搜索引擎前端</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* 自定义加载动画 */
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-radius: 50%;
+            border-top: 4px solid #3498db;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="containerl">
+        <header>
+            <h1>
+                C++ 搜索引擎
+            </h1>
+            <p class="subtitle">基于 BM25 的倒排索引检索系统</p>
+        </header>
+
+        <main>
+            <!-- 搜索表单 -->
+            <div class="search-section">
+                <div class="search-box">
+                    <input 
+                        type="text" 
+                        id="queryInput" 
+                        placeholder="输入您的查询..."
+                        autocomplete="off"
+                    >
+                    <button id="searchButton">
+                        搜索
+                    </button>
+                </div>
+                
+                <!-- 高级选项 -->
+                <div class="advanced-options">
+                    <h3>Advanced Options</h3>
+                    <div class="options-grid">
+                        <!-- 查询模式 -->
+                        <div class="option-item">
+                            <label for="queryMode">Query Mode</label>
+                            <select id="queryMode">
+                                <option value="or" selected> OR </option>
+                                <option value="and"> AND </option>
+                            </select>
+                        </div>
+
+                        <!-- 返回结果数 -->
+                        <div class="option-item">
+                            <label for="kValue">结果数量 (k)</label>
+                            <input type="number" id="kValue" value="10" min="1" max="100">
+                        </div>
+
+                        <!-- BM25 k1 -->
+                        <div class="option-item">
+                            <label for="k1Value">BM25 k1</label>
+                            <input type="number" id="k1Value" value="0.9" step="0.1" min="0" max="3">
+                        </div>
+
+                        <!-- BM25 b -->
+                        <div class="option-item">
+                            <label for="bValue">BM25 b</label>
+                            <input type="number" id="bValue" value="0.4" step="0.1" min="0" max="1">
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 结果区域 -->
+            <div class="bg-gray-800 rounded-2xl shadow-lg p-6 min-h-[200px]">
+                <h2 class="text-2xl font-bold mb-4 border-b border-gray-700 pb-2">搜索结果</h2>
+                <div id="results-container" class="space-y-4">
+                    <!-- 加载动画 -->
+                    <div id="loader" class="hidden mx-auto loader"></div>
+                    <!-- 消息提示 -->
+                    <p id="message" class="text-gray-500 text-center">在此处查看搜索结果。</p>
+                    <!-- 结果列表 -->
+                    <div id="results-list" class="divide-y divide-gray-700"></div>
+                </div>
+            </div>
+        </main>
+
+    </div>
+
+    <script>
+        // 获取DOM元素
+        const queryInput = document.getElementById('queryInput');
+        const searchButton = document.getElementById('searchButton');
+        const resultsContainer = document.getElementById('results-list');
+        const message = document.getElementById('message');
+        const loader = document.getElementById('loader');
+
+        // 绑定回车键事件
+        queryInput.addEventListener('keyup', (event) => {
+            if (event.key === 'Enter') {
+                searchButton.click();
+            }
+        });
+
+        
+        searchButton.addEventListener('click',async() => {
+            const query = queryInput.value.trim();
+            if (!query) {
+                showMessage('please enter query word');
+                return;
+            }
+
+            const mode = document.getElementById('queryMode').value;
+            const k = document.getElementById('kValue').value;
+            const k1 = document.getElementById('k1Value').value;
+            const b = document.getElementById('bValue').value;
+
+            
+            loader.classList.remove('hidden');
+            message.textContent = '';
+            resultsContainer.innerHTML = '';
+
+            try {
+                // 调用API
+                // const response = await fetch(`/api/search?q=${encodeURIComponent(query)}&mode=${mode}&k=${k}`);
+                // const response = await fetch('/search', {
+                //     method: 'Get',
+                //     headers: { 'Content-Type': 'application/json' },
+                //     body: JSON.stringify({ q: query, mode, k, k1, b })
+                // });
+                const params = new URLSearchParams({
+                    q: query,
+                    mode: mode,
+                    k: k,
+                    k1: k1,    // ✅ 新增
+                    b: b   
+                    // k1 和 b 暂时不支持动态修改
+                });
+
+                const response = await fetch(`/search?${params.toString()}`, {
+                    method: 'GET'  // ✅ 使用 GET
+                });
+                if (!response.ok) {
+                    throw new Error('Server error');
+                }
+
+                const data = await response.json();
+                displayResults(data.results, data.ms);
+            } catch (error) {
+                message.textContent = 'Search failed: ' + error.message;
+            } finally {
+                loader.classList.add('hidden');
+            }
+        });
+
+        function showMessage(msg) {
+            resultsContainer.innerHTML = '';
+            message.textContent = msg;
+            message.classList.remove('hidden');
+        }
+
+        function displayResults(results, ms = 0) {
+            resultsContainer.innerHTML = '';
+            
+            if (results.length === 0) {
+                message.textContent = 'Did not find any results.';
+                return;
+            }
+
+            message.classList.add('hidden');
+            
+            message.textContent = `共 ${results.length} 条结果，耗时 ${ms} ms`;
+            results.forEach((result, index) => {
+                const resultElement = document.createElement('div');
+                resultElement.className = 'pt-4';
+                resultElement.innerHTML = `
+                    <div class="flex items-start gap-4">
+                        <div class="text-xl font-bold text-gray-500">${index + 1}</div>
+                        <div class="flex-1">
+                            <h3 class="text-lg font-semibold text-blue-400">${result.name}</h3>
+                            <div class="text-sm text-gray-400 mt-1 flex gap-4">
+                                <span>DocID: <span class="font-mono text-teal-400">${result.docID}</span></span>
+                                <span>Score: <span class="font-mono text-teal-400">${result.score.toFixed(4)}</span></span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                resultsContainer.appendChild(resultElement);
+            });
+        }
+
+        // 页面加载时聚焦搜索框
+        window.addEventListener('load', () => {
+            queryInput.focus();
+        });
+    </script>
+</body>
+</html>
