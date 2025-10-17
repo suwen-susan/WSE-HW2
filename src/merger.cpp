@@ -11,30 +11,40 @@
 
 namespace fs = std::filesystem;
 
-// 倒排索引合并器：将排序后的 posting 流聚合为块化压缩索引
+/**
+ * IndexMerger: Merges sorted postings into a compressed inverted index
+ * 
+ * This class implements Phase 2 of the indexing pipeline. It reads sorted postings
+ * from Phase 1 and creates a block-compressed inverted index with:
+ * - Block-compressed docIDs (gap-encoded with VarByte)
+ * - Block-compressed frequencies (VarByte encoded)
+ * - Lexicon mapping terms to posting list offsets
+ * - Index statistics for BM25 scoring
+ */
 class IndexMerger {
 private:
-    // 配置参数
-    static constexpr size_t BLOCK_SIZE = 128;        // 每块的 posting 数量
-    static constexpr size_t READ_BUFFER_SIZE = 8 * 1024 * 1024;  // 8MB 读缓冲
+    // Block size for compression (number of postings per block)
+    static constexpr size_t BLOCK_SIZE = 128;
+    // Buffer size for efficient I/O operations
+    static constexpr size_t READ_BUFFER_SIZE = 8 * 1024 * 1024;
     
-    // 输入输出路径
-    std::string inputFile;      // 排序后的 postings_sorted.tsv
-    std::string outputDir;      // 输出目录
+    // Input/output paths
+    std::string inputFile;      // Sorted postings file from Phase 1
+    std::string outputDir;      // Output directory for index files
     
-    // 输出文件流
-    std::ofstream docIdsFile;   // docIDs 块化压缩文件
-    std::ofstream freqsFile;    // frequencies 块化压缩文件
-    std::ofstream lexiconFile;  // 词典文件（文本格式，便于调试）
-    std::ofstream statsFile;    // 统计信息文件
+    // Output file streams
+    std::ofstream docIdsFile;   // Block-compressed docIDs
+    std::ofstream freqsFile;    // Block-compressed frequencies
+    std::ofstream lexiconFile;  // Term dictionary (text format for debugging)
+    std::ofstream statsFile;    // Index statistics
     
-    // 统计信息
-    uint64_t totalTerms;        // 词项总数
-    uint64_t totalPostings;     // posting 总数
-    uint64_t docCount;          // 文档总数
-    std::vector<uint32_t> docLengths; // 每个文档的长度（用于计算 avgdl）
+    // Statistics accumulators
+    uint64_t totalTerms;        // Total number of unique terms
+    uint64_t totalPostings;     // Total number of postings
+    uint64_t docCount;          // Total number of documents
+    std::vector<uint32_t> docLengths;  // Document lengths for BM25 avgdl
     
-    // 单个 posting 结构
+    // Posting structure for in-memory representation
     struct Posting {
         uint32_t docID;
         uint32_t frequency;
@@ -47,10 +57,8 @@ public:
         : inputFile(input), outputDir(outDir),
           totalTerms(0), totalPostings(0), docCount(0) {
         
-        // 创建输出目录
         fs::create_directories(outputDir);
         
-        // 打开输出文件
         docIdsFile.open(outputDir + "/postings.docids.bin", 
                         std::ios::out | std::ios::binary);
         freqsFile.open(outputDir + "/postings.freqs.bin", 
@@ -63,7 +71,6 @@ public:
             exit(1);
         }
         
-        // 写词典文件头（便于理解格式）
         lexiconFile << "# term\tdf\tcf\tdocids_offset\tfreqs_offset\tblocks_count\n";
     }
     
@@ -74,7 +81,15 @@ public:
         if (statsFile.is_open()) statsFile.close();
     }
     
-    // 主处理流程
+    /**
+     * Main processing pipeline: reads sorted postings and writes compressed index
+     * 
+     * Algorithm:
+     * 1. Stream through sorted postings line by line
+     * 2. Group postings by term (postings are sorted by term, then by docID)
+     * 3. For each complete term, write its inverted list in compressed blocks
+     * 4. Generate lexicon entries and statistics
+     */
     void process() {
         std::ifstream inFile(inputFile);
         if (!inFile.is_open()) {
@@ -82,7 +97,7 @@ public:
             exit(1);
         }
         
-        // 设置读缓冲以提升 I/O 效率
+        // Set read buffer for efficient I/O
         std::vector<char> readBuffer(READ_BUFFER_SIZE);
         inFile.rdbuf()->pubsetbuf(readBuffer.data(), READ_BUFFER_SIZE);
         
@@ -91,18 +106,17 @@ public:
         std::cout << "Output: " << outputDir << std::endl;
         std::cout << "Block size: " << BLOCK_SIZE << std::endl;
         
-        // 流式处理：逐行读取，按 term 分组
+        // Streaming processing: read line by line, group by term
         std::string line;
         std::string currentTerm;
         std::vector<Posting> currentPostings;
-        currentPostings.reserve(1024); // 预分配空间
+        currentPostings.reserve(1024);  // Pre-allocate for efficiency
         
         uint64_t linesProcessed = 0;
         
         while (std::getline(inFile, line)) {
-            if (line.empty() || line[0] == '#') continue; // 跳过空行和注释
+            if (line.empty() || line[0] == '#') continue;  // Skip empty lines and comments
             
-            // 解析行：term<TAB>docID<TAB>tf
             size_t tab1 = line.find('\t');
             size_t tab2 = line.find('\t', tab1 + 1);
             
@@ -111,26 +125,27 @@ public:
                 continue;
             }
             
+            // Parse line: term<TAB>docID<TAB>tf
             std::string term = line.substr(0, tab1);
             uint32_t docID = std::stoul(line.substr(tab1 + 1, tab2 - tab1 - 1));
             uint32_t tf = std::stoul(line.substr(tab2 + 1));
             
-            // 更新文档计数
+            // Update document count
             if (docID >= docCount) {
                 docCount = docID + 1;
             }
             
-            // 检查是否切换到新 term
+            // Check if we've moved to a new term
             if (term != currentTerm) {
                 if (!currentPostings.empty()) {
-                    // 写出前一个 term 的倒排表
+                    // Write out the inverted list for the previous term
                     writeInvertedList(currentTerm, currentPostings);
                     currentPostings.clear();
                 }
                 currentTerm = term;
             }
             
-            // 累积当前 term 的 posting
+            // Accumulate posting for current term
             currentPostings.emplace_back(docID, tf);
             
             linesProcessed++;
@@ -140,14 +155,14 @@ public:
             }
         }
         
-        // 写出最后一个 term
+        // Write out the last term
         if (!currentPostings.empty()) {
             writeInvertedList(currentTerm, currentPostings);
         }
         
         inFile.close();
         
-        // 写统计信息
+        // Write statistics and document lengths
         writeStats();
         
         std::cout << "\nMerging complete!" << std::endl;
@@ -157,33 +172,37 @@ public:
     }
     
 private:
-    // 写出单个 term 的倒排表（块化压缩）
+    /**
+     * Write inverted list for a single term using block compression
+     * 
+     * Format:
+     * - docIDs: block_size + gap-encoded docID sequence (VarByte)
+     * - frequencies: block_size + tf sequence (VarByte)
+     * - lexicon: term metadata (df, cf, offsets, block count)
+     */
     void writeInvertedList(const std::string& term, const std::vector<Posting>& postings) {
         if (postings.empty()) return;
         
-        // 记录写入前的偏移量
+        // Record file offsets before writing
         uint64_t docIdsOffset = docIdsFile.tellp();
         uint64_t freqsOffset = freqsFile.tellp();
         
-        // 计算统计信息
-        uint32_t df = static_cast<uint32_t>(postings.size());  // document frequency
-        uint64_t cf = 0;  // collection frequency (sum of all tf)
+        // Calculate statistics
+        uint32_t df = static_cast<uint32_t>(postings.size());  // Document frequency
+        uint64_t cf = 0;  // Collection frequency (sum of all tf)
         
-        // 按块写入
+        // Write in blocks for compression efficiency
         size_t blocksCount = 0;
         for (size_t i = 0; i < postings.size(); i += BLOCK_SIZE) {
             size_t blockLen = std::min(BLOCK_SIZE, postings.size() - i);
             
-            // 写 docIDs 块
             writeDocIDsBlock(postings, i, blockLen);
             
-            // 写 frequencies 块
             writeFrequenciesBlock(postings, i, blockLen, cf);
             
             blocksCount++;
         }
         
-        // 写词典条目
         lexiconFile << term << "\t" 
                     << df << "\t" 
                     << cf << "\t"
@@ -195,15 +214,17 @@ private:
         totalPostings += df;
     }
     
-    // 写 docIDs 块（差分 + VarByte 编码）
+    /**
+     * Write docIDs block with gap encoding and VarByte compression
+     * 
+     * Block format: block_length + docID_sequence
+     * docID_sequence uses gap encoding: first docID is absolute,
+     * subsequent docIDs are stored as gaps (docID[i] - docID[i-1])
+     */
     void writeDocIDsBlock(const std::vector<Posting>& postings, 
                           size_t start, size_t length) {
-        // 块格式：block_length + docID序列（差分编码）
-        
-        // 写块长度
         varbyte::encode(docIdsFile, static_cast<uint32_t>(length));
         
-        // 写 docID 序列（差分编码）
         uint32_t prevDocID = 0;
         for (size_t i = 0; i < length; i++) {
             uint32_t docID = postings[start + i].docID;
@@ -213,21 +234,23 @@ private:
         }
     }
     
-    // 写 frequencies 块（VarByte 编码）
+    /**
+     * Write frequencies block with VarByte compression
+     * 
+     * Block format: block_length + tf_sequence
+     * Also updates collection frequency (cf) and document lengths
+     * for BM25 avgdl calculation
+     */
     void writeFrequenciesBlock(const std::vector<Posting>& postings, 
                                size_t start, size_t length, uint64_t& cf) {
-        // 块格式：block_length + tf序列
-        
-        // 写块长度
         varbyte::encode(freqsFile, static_cast<uint32_t>(length));
         
-        // 写 tf 序列
         for (size_t i = 0; i < length; i++) {
             uint32_t tf = postings[start + i].frequency;
             varbyte::encode(freqsFile, tf);
             cf += tf;
             
-            // 更新文档长度（用于 BM25 的 avgdl）
+            // Update document length for BM25 avgdl calculation
             uint32_t docID = postings[start + i].docID;
             if (docID >= docLengths.size()) {
                 docLengths.resize(docID + 1, 0);
@@ -236,9 +259,14 @@ private:
         }
     }
     
-    // 写统计信息和文档长度
+    /**
+     * Write statistics file and document lengths file
+     * 
+     * Outputs:
+     * - doc_len.bin: binary file with document lengths (needed for BM25)
+     * - stats.txt: text file with index statistics (doc_count, avgdl, etc.)
+     */
     void writeStats() {
-        // 写文档长度文件（BM25 需要）
         std::ofstream docLenFile(outputDir + "/doc_len.bin", std::ios::out | std::ios::binary);
         if (docLenFile.is_open()) {
             for (uint32_t len : docLengths) {
@@ -250,21 +278,18 @@ private:
             std::cerr << "Warning: Failed to write doc_len.bin" << std::endl;
         }
         
-        // 写统计信息
         statsFile.open(outputDir + "/stats.txt", std::ios::out);
         if (!statsFile.is_open()) {
             std::cerr << "Failed to open stats file" << std::endl;
             return;
         }
         
-        // 计算平均文档长度
         uint64_t totalDocLength = 0;
         for (uint32_t len : docLengths) {
             totalDocLength += len;
         }
         double avgdl = (docCount > 0) ? static_cast<double>(totalDocLength) / docCount : 0.0;
         
-        // 写统计信息
         statsFile << "# Index Statistics\n";
         statsFile << "doc_count\t" << docCount << "\n";
         statsFile << "total_terms\t" << totalTerms << "\n";

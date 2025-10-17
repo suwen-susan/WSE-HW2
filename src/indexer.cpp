@@ -11,8 +11,10 @@
 
 namespace fs = std::filesystem;
 
-// 辅助函数：截取文本片段作为摘要
-// 处理特殊字符（tab, 换行符）避免破坏 TSV 格式
+/**
+ * Helper function: Extract text snippet for document table
+ * Handles special characters (tabs, newlines) to avoid breaking TSV format
+ */
 inline std::string makeSnippet(const std::string& text, size_t maxLen = 60) {
     std::string snippet;
     snippet.reserve(maxLen);
@@ -21,18 +23,16 @@ inline std::string makeSnippet(const std::string& text, size_t maxLen = 60) {
     for (unsigned char ch : text) {
         if (count >= maxLen) break;
         
-        // 将 tab 和换行符替换为空格
         if (ch == '\t' || ch == '\n' || ch == '\r') {
             if (!snippet.empty() && snippet.back() != ' ') {
                 snippet.push_back(' ');
             }
-        } else if (ch >= 32 || ch == '\t') {  // 可打印字符
+        } else if (ch >= 32 || ch == '\t') {
             snippet.push_back(ch);
             count++;
         }
     }
     
-    // 去除尾部空格
     while (!snippet.empty() && snippet.back() == ' ') {
         snippet.pop_back();
     }
@@ -40,24 +40,39 @@ inline std::string makeSnippet(const std::string& text, size_t maxLen = 60) {
     return snippet;
 }
 
+/**
+ * IndexBuilder: Phase 1 of the indexing pipeline
+ * 
+ * This class processes the raw document collection and generates:
+ * 1. Document table mapping internal docIDs to original IDs
+ * 2. Document content storage for snippet generation
+ * 3. Flat posting files (term, docID, tf triples)
+ * 
+ * Features:
+ * - Streaming processing for memory efficiency
+ * - Automatic partitioning into multiple files to avoid single huge files
+ * - Preserves all terms (no stopword filtering)
+ */
 class IndexBuilder {
 private:
-    uint32_t currentDocID;
-    std::string outputDir;
-    int batchNumber;
+    uint32_t currentDocID;      // Current document ID being processed
+    std::string outputDir;       // Output directory
+    int batchNumber;             // Current partition number
     
-    // 文档表文件
-    std::ofstream docTableFile;
-    std::ofstream docContentFile;
-    std::ofstream docOffsetFile;     // docID -> (offset, length)
+    // Output file streams
+    std::ofstream docTableFile;     // docID -> original ID mapping
+    std::ofstream docContentFile;   // Full document content storage
+    std::ofstream docOffsetFile;    // docID -> (offset, length) in content file
     
-    // 扁平 posting 输出文件（分片滚动写）
-    std::ofstream postingsOut;
-    size_t partByteLimit;      // 每个分片的字节阈值
-    size_t bytesWrittenInPart; // 当前分片累计字节（粗略估算）
-    size_t linesWrittenInPart; // 当前分片累计行数
+    std::ofstream postingsOut;      // Current posting partition file
+    size_t partByteLimit;           // Byte threshold for each partition
+    size_t bytesWrittenInPart;      // Bytes written in current partition
+    size_t linesWrittenInPart;      // Lines written in current partition
     
-    // 打开新的 posting 分片文件
+    /**
+     * Open a new posting partition file
+     * Called when current partition exceeds size threshold
+     */
     void openNewPart() {
         if (postingsOut.is_open()) {
             postingsOut.close();
@@ -73,7 +88,9 @@ private:
         std::cout << "Opened " << filename << std::endl;
     }
     
-    // 检查并滚动到新分片
+    /**
+     * Check if current partition exceeds size limit and rollover to new partition
+     */
     void rolloverIfNeeded() {
         if (bytesWrittenInPart >= partByteLimit) {
             std::cout << "Batch " << batchNumber << " written: " 
@@ -89,17 +106,13 @@ public:
         : currentDocID(0), outputDir(outDir), batchNumber(0),
           partByteLimit(partBytes), bytesWrittenInPart(0), linesWrittenInPart(0) {
         
-        // 创建输出目录
         fs::create_directories(outputDir);
         
-        // 打开文档表文件
         docTableFile.open(outputDir + "/doc_table.txt", std::ios::out);
         
-        // 文档内容：追加所有文档内容
         docContentFile.open(outputDir + "/doc_content.bin", 
                            std::ios::out | std::ios::binary);
         
-        // 偏移量表：docID -> (offset, length)
         docOffsetFile.open(outputDir + "/doc_offset.bin", 
                           std::ios::out | std::ios::binary);
         
@@ -109,7 +122,6 @@ public:
             exit(1);
         }
         
-        // 打开第一个 posting 分片
         openNewPart();
     }
     
@@ -124,67 +136,68 @@ public:
         }
     }
    
-    // 解析单个文档
+    /**
+     * Parse a single document and generate postings
+     * 
+     * Steps:
+     * 1. Write document table entry (docID -> original ID)
+     * 2. Store full document content for later snippet generation
+     * 3. Record content offset and length
+     * 4. Tokenize document and compute term frequencies
+     * 5. Write postings (term, docID, tf) to current partition
+     */
     void parseDocument(const std::string& docName, const std::string& content) {
-        // // 记录文档ID和文档名的映射
-        // // 格式：internalDocID \t originalDocID \t passage_snippet
-        // std::string snippet = makeSnippet(content, 60);
-        // docTableFile << currentDocID << "\t" << docName << "\t" << snippet << "\n";
-        
-         // 1. 文档表：docID -> originalID
+        // Write document table entry
         docTableFile << currentDocID << "\t" << docName << "\n";
         
-        // 2. 写入文档内容并记录偏移量
-        uint64_t offset = docContentFile.tellp();  // 当前写位置
+        // Store document content and record offset
+        uint64_t offset = docContentFile.tellp();
         
-        // 清理内容（去除 tab 和换行符，保持单行便于处理）
+        // Clean content (remove tabs and newlines to keep single-line format)
         std::string cleanContent = content;
         std::replace(cleanContent.begin(), cleanContent.end(), '\t', ' ');
         std::replace(cleanContent.begin(), cleanContent.end(), '\n', ' ');
         std::replace(cleanContent.begin(), cleanContent.end(), '\r', ' ');
         
-        // 写入内容（带换行符作为分隔）
         docContentFile << cleanContent << "\n";
         
         uint64_t afterOffset = docContentFile.tellp();
-        uint32_t length = static_cast<uint32_t>(afterOffset - offset - 1);  // 减去换行符
+        uint32_t length = static_cast<uint32_t>(afterOffset - offset - 1);
         
-        // 3. 写入偏移量信息：offset (8 bytes) + length (4 bytes)
+        // Write offset info: offset (8 bytes) + length (4 bytes)
         docOffsetFile.write(reinterpret_cast<const char*>(&offset), sizeof(uint64_t));
         docOffsetFile.write(reinterpret_cast<const char*>(&length), sizeof(uint32_t));
         
-        
-        // 统计当前文档中每个term的频率
+        // Compute term frequencies for this document
         std::unordered_map<std::string, uint32_t> termFreq;
-        termFreq.reserve(256); // 预分配减少rehash
+        termFreq.reserve(256);  // Pre-allocate to reduce rehashing
         
-        // 使用新的分词函数（保留所有词，包括数字、单字符、停用词）
         for (const auto& token : tokenize_words(content)) {
             termFreq[token]++;
         }
         
-        // 逐 posting 行写出：term<TAB>docID<TAB>tf
+        // Write postings: term<TAB>docID<TAB>tf
         for (const auto& kv : termFreq) {
             const std::string& term = kv.first;
             uint32_t tf = kv.second;
             
             postingsOut << term << "\t" << currentDocID << "\t" << tf << "\n";
             
-            // 粗略估算字节数（避免频繁调用 tellp 的系统开销）
-            // term + tab + docID(最多10位) + tab + tf(最多5位) + newline
+            // Estimate bytes written (avoid frequent tellp() calls for efficiency)
             bytesWrittenInPart += term.size() + 1 + 10 + 1 + 5 + 1;
             linesWrittenInPart++;
         }
         
         currentDocID++;
         
-        // 检查是否需要滚动到新分片
+        // Check if we need to rollover to a new partition
         rolloverIfNeeded();
     }
     
-    // 处理完所有文档后的收尾工作
+    /**
+     * Finalize indexing: close all files and print summary
+     */
     void finalize() {
-        // 关闭所有文件
         if (postingsOut.is_open()) {
             std::cout << "Batch " << batchNumber << " written: " 
                       << linesWrittenInPart << " postings (~" 
@@ -202,7 +215,10 @@ public:
         std::cout << "  Example: msort -t '\\t' -k 1,1 -k 2,2n postings_part_*.tsv > postings_sorted.tsv" << std::endl;
     }
     
-    // 处理MS MARCO数据集格式：tsv文件 (docID \t passage)
+    /**
+     * Process MS MARCO dataset format: TSV file (docID \t passage)
+     * Streams through the input file and processes documents one by one
+     */
     void processMSMARCO(const std::string& inputFile) {
         std::ifstream inFile(inputFile);
         if (!inFile.is_open()) {
@@ -220,7 +236,7 @@ public:
                 std::cout << "Processed " << lineCount << " documents..." << std::endl;
             }
             
-            // 解析TSV格式：docID \t passage
+            // Parse TSV format: docID \t passage
             size_t tabPos = line.find('\t');
             if (tabPos == std::string::npos) continue;
             
@@ -247,7 +263,6 @@ int main(int argc, char* argv[]) {
     std::string inputFile = argv[1];
     std::string outputDir = argv[2];
     
-    // 可选：从命令行指定分片大小（GB）
     size_t partSizeGB = 2;
     if (argc >= 4) {
         partSizeGB = std::stoull(argv[3]);
@@ -259,10 +274,8 @@ int main(int argc, char* argv[]) {
     std::cout << "Output: " << outputDir << std::endl;
     std::cout << "Part size: " << partSizeGB << " GB" << std::endl;
     
-    // 创建索引构建器（分片大小可配置，默认2GB）
     IndexBuilder builder(outputDir, partBytes);
     
-    // 处理数据集
     builder.processMSMARCO(inputFile);
     
     std::cout << "\nIndex building phase 1 complete!" << std::endl;
