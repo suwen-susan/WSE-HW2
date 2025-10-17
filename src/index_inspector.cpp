@@ -7,7 +7,6 @@
 #include "varbyte.hpp"
 
 // 索引检查工具：读取并显示倒排表内容，验证索引正确性
-
 class IndexInspector {
 private:
     std::string indexDir;

@@ -6,22 +6,35 @@
 #include <unordered_map>
 #include <fstream>
 #include <sstream>
-#include <cstdint>
 #include <iostream>
+#include <cstdint>
 #include "varbyte.hpp"
 
-// 词项元数据
+// Term metadata
 struct TermMeta {
     uint32_t df;              // document frequency
     uint64_t cf;              // collection frequency
-    uint64_t docids_offset;   // 在 postings.docids.bin 中的偏移
-    uint64_t freqs_offset;    // 在 postings.freqs.bin 中的偏移
-    uint32_t blocks;          // 块数量
+    uint64_t docids_offset;   // offset in postings.docids.bin 
+    uint64_t freqs_offset;    // offset in postings.freqs.bin
+    uint32_t blocks;          // number of blocks
     
     TermMeta() : df(0), cf(0), docids_offset(0), freqs_offset(0), blocks(0) {}
 };
 
-// 词典：term -> TermMeta
+/**
+ * @brief Metadata entry for a single term in the lexicon.
+ * 
+ * Each entry records where this term’s posting list is stored in
+ * the index files, how many documents contain it, and its total term frequency.
+ */
+struct LexiconEntry {
+    uint64_t docids_offset;   // Byte offset of docIDs list in postings.docids.bin
+    uint64_t freqs_offset;    // Byte offset of term frequencies list
+    uint32_t df;              // Number of documents containing the term
+    uint64_t total_tf;        // Total occurrences of this term in the corpus
+};
+
+// Lexicon: term -> TermMeta
 class Lexicon {
 private:
     std::unordered_map<std::string, TermMeta> terms;
@@ -64,7 +77,7 @@ public:
     size_t size() const { return terms.size(); }
 };
 
-// 统计信息
+// Collection statistics
 class Stats {
 public:
     uint64_t doc_count;
@@ -100,11 +113,10 @@ public:
     }
 };
 
-// 文档表：docID -> (originalDocID, snippet)
+// Document table: docID -> (originalDocID)
 class DocTable {
 private:
     std::vector<std::string> originalIDs;
-    std::vector<std::string> snippets;
     
 public:
     bool load(const std::string& path) {
@@ -117,7 +129,7 @@ public:
         std::string line;
         uint32_t maxDocID = 0;
         
-        // 先统计最大 docID
+        // First pass: determine the maximum internal docID
         while (std::getline(file, line)) {
             if (line.empty()) continue;
             size_t tab = line.find('\t');
@@ -128,46 +140,31 @@ public:
         }
         
         originalIDs.resize(maxDocID + 1);
-        snippets.resize(maxDocID + 1);
         
-        // 重新读取
+        // Rewind and read again
         file.clear();
         file.seekg(0);
         
         while (std::getline(file, line)) {
             if (line.empty()) continue;
             
-            // 解析三列格式：internalDocID \t originalDocID \t snippet
+            // Parse three-column format: internalDocID \t originalDocID
             size_t tab1 = line.find('\t');
             if (tab1 == std::string::npos) continue;
             
             uint32_t docID = std::stoul(line.substr(0, tab1));
-            
-            size_t tab2 = line.find('\t', tab1 + 1);
-            if (tab2 == std::string::npos) continue;
-            
-            std::string originalID = line.substr(tab1 + 1, tab2 - tab1 - 1);
-            std::string snippet = line.substr(tab2 + 1);
+
+            std::string originalID = line.substr(tab1 + 1);
             
             originalIDs[docID] = originalID;
-            snippets[docID] = snippet;
         }
         
         file.close();
-        std::cout << "Loaded " << snippets.size() << " documents from doc table" << std::endl;
+        std::cout << "Loaded " << originalIDs.size() << " documents from doc table" << std::endl;
         return true;
     }
-    
-    // 返回文档片段（用于显示）
-    const std::string& name(uint32_t docID) const {
-        static const std::string empty;
-        if (docID < snippets.size()) {
-            return snippets[docID];
-        }
-        return empty;
-    }
-    
-    // 返回原始文档 ID
+
+    // Return the original document ID
     const std::string& originalID(uint32_t docID) const {
         static const std::string empty;
         if (docID < originalIDs.size()) {
@@ -176,10 +173,10 @@ public:
         return empty;
     }
     
-    size_t size() const { return snippets.size(); }
+    size_t size() const { return originalIDs.size(); }
 };
 
-// 文档长度：docID -> length
+// Document lengths: docID -> length
 class DocLen {
 private:
     std::vector<uint32_t> lengths;
@@ -192,7 +189,7 @@ public:
             return false;
         }
         
-        // 读取所有文档长度
+        // Read all document lengths
         uint32_t len;
         while (file.read(reinterpret_cast<char*>(&len), sizeof(uint32_t))) {
             lengths.push_back(len);
@@ -213,49 +210,59 @@ public:
     size_t size() const { return lengths.size(); }
 };
 
-// 倒排表遍历器（支持 DAAT）
+/**
+ * @brief Represents a posting list for a specific term.
+ * 
+ * Provides sequential access to compressed posting data (docIDs and term frequencies).
+ * Implements local decoding rather than decompressing entire lists at once.
+*/
 class PostingList {
 private:
-    std::ifstream* docidsFile;
-    std::ifstream* freqsFile;
+    std::ifstream docidsFile;
+    std::ifstream freqsFile;
     
-    // 块状态
+    // block state
     uint32_t totalBlocks;
     uint32_t currentBlock;
     uint32_t blockLen;
     uint32_t blockPos;
     
-    // 当前文档状态
+    // current state
     uint32_t currentDocID;
     uint32_t currentFreq;
     bool hasMore;
     
-    // 块缓冲
+    // buffer for current block
     std::vector<uint32_t> docIDsBuffer;
     std::vector<uint32_t> freqsBuffer;
     
-    // 读取下一块
+    // load next block
     bool loadNextBlock() {
         if (currentBlock >= totalBlocks) {
             hasMore = false;
             return false;
         }
         
-        // 读取 docIDs 块
-        blockLen = varbyte::decode(*docidsFile);
+        // load docIDs block
+        blockLen = varbyte::decode(docidsFile);
+        if (!docidsFile.good()) {
+            hasMore = false;
+            return false;
+        }
+
         docIDsBuffer.clear();
         docIDsBuffer.reserve(blockLen);
         
         uint32_t prevDocID = 0;
         for (uint32_t i = 0; i < blockLen; i++) {
-            uint32_t gap = varbyte::decode(*docidsFile);
+            uint32_t gap = varbyte::decode(docidsFile);
             uint32_t docID = (i == 0) ? gap : (prevDocID + gap);
             docIDsBuffer.push_back(docID);
             prevDocID = docID;
         }
         
-        // 读取 frequencies 块
-        uint32_t blockLenFreq = varbyte::decode(*freqsFile);
+        // load freqs block
+        uint32_t blockLenFreq = varbyte::decode(freqsFile);
         if (blockLenFreq != blockLen) {
             std::cerr << "Error: block length mismatch!" << std::endl;
             hasMore = false;
@@ -265,7 +272,7 @@ private:
         freqsBuffer.clear();
         freqsBuffer.reserve(blockLen);
         for (uint32_t i = 0; i < blockLen; i++) {
-            freqsBuffer.push_back(varbyte::decode(*freqsFile));
+            freqsBuffer.push_back(varbyte::decode(freqsFile));
         }
         
         blockPos = 0;
@@ -275,29 +282,36 @@ private:
     
 public:
     PostingList() 
-        : docidsFile(nullptr), freqsFile(nullptr),
-          totalBlocks(0), currentBlock(0), blockLen(0), blockPos(0),
+        : totalBlocks(0), currentBlock(0), blockLen(0), blockPos(0),
           currentDocID(0), currentFreq(0), hasMore(false) {}
     
-    // 打开倒排表
-    bool open(const TermMeta& meta, std::ifstream& docids, std::ifstream& freqs) {
-        docidsFile = &docids;
-        freqsFile = &freqs;
+    // open posting list for a term
+    bool open(const TermMeta& meta, const std::string& indexDir) {
+        std::string docPath = indexDir + "/postings.docids.bin";
+        std::string freqPath = indexDir + "/postings.freqs.bin";
+
+        docidsFile.open(docPath, std::ios::binary);
+        freqsFile.open(freqPath, std::ios::binary);
+        if (!docidsFile.is_open() || !freqsFile.is_open()) {
+            std::cerr << "Failed to open posting list files\n";
+            return false;
+        }
+
         totalBlocks = meta.blocks;
         currentBlock = 0;
         
-        // seek 到起始位置
-        docidsFile->seekg(meta.docids_offset);
-        freqsFile->seekg(meta.freqs_offset);
+        // seek to offsets
+        docidsFile.seekg(meta.docids_offset);
+        freqsFile.seekg(meta.freqs_offset);
         
         hasMore = true;
         
-        // 加载第一块
+        // load first block
         if (!loadNextBlock()) {
             return false;
         }
         
-        // 设置第一个文档
+        // initialize current docID and freq
         if (blockLen > 0) {
             currentDocID = docIDsBuffer[0];
             currentFreq = freqsBuffer[0];
@@ -308,20 +322,20 @@ public:
         return false;
     }
     
-    // 移动到下一个文档
+    // move to next document
     bool next() {
         if (!hasMore) return false;
         
         blockPos++;
         
-        // 如果当前块还有数据
+        // if still within current block
         if (blockPos < blockLen) {
             currentDocID = docIDsBuffer[blockPos];
             currentFreq = freqsBuffer[blockPos];
             return true;
         }
         
-        // 需要加载下一块
+        // load next block
         if (loadNextBlock() && blockLen > 0) {
             currentDocID = docIDsBuffer[0];
             currentFreq = freqsBuffer[0];
@@ -332,7 +346,7 @@ public:
         return false;
     }
     
-    // 移动到 >= target 的第一个文档
+    // move to first docID >= target
     bool nextGEQ(uint32_t target) {
         while (hasMore && currentDocID < target) {
             if (!next()) {
@@ -342,15 +356,126 @@ public:
         return hasMore && currentDocID >= target;
     }
     
-    // 当前文档 ID
+    // current docID
     uint32_t doc() const { return currentDocID; }
     
-    // 当前频率
+    // current freq
     uint32_t freq() const { return currentFreq; }
     
-    // 是否还有更多文档
+    // whether there are more documents
     bool valid() const { return hasMore; }
 };
+
+// Document content reader (based on offsets)
+class DocContentFile {
+private:
+    struct DocOffset {
+        uint64_t offset;
+        uint32_t length;
+    };
+    
+    std::string contentFilePath;
+    std::vector<DocOffset> offsets;
+    mutable std::ifstream contentFile;
+    
+public:
+    DocContentFile() {}
+    
+    ~DocContentFile() {
+        if (contentFile.is_open()) {
+            contentFile.close();
+        }
+    }
+    
+    bool load(const std::string& offsetPath, const std::string& contentPath) {
+        contentFilePath = contentPath;
+        
+        // 1. Load the offset table into memory
+        std::ifstream offsetFile(offsetPath, std::ios::binary);
+        if (!offsetFile.is_open()) {
+            std::cerr << "Cannot open offset file: " << offsetPath << std::endl;
+            return false;
+        }
+        
+        // Read all offsets (each entry is 12 bytes: 8 bytes offset + 4 bytes length)
+        uint64_t offset;
+        uint32_t length;
+        while (offsetFile.read(reinterpret_cast<char*>(&offset), sizeof(uint64_t))) {
+            if (offsetFile.read(reinterpret_cast<char*>(&length), sizeof(uint32_t))) {
+                offsets.push_back({offset, length});
+            } else {
+                break;
+            }
+        }
+        offsetFile.close();
+        
+        std::cout << "Loaded offsets for " << offsets.size() << " documents" << std::endl;
+
+        // Open the content file and keep it open for reuse
+        contentFile.open(contentPath, std::ios::binary);
+        if (!contentFile.is_open()) {
+            std::cerr << "Cannot open content file: " << contentPath << std::endl;
+            return false;
+        }
+        
+        return true;
+    }
+    
+    // Get single document content
+    std::string get(uint32_t docID) const {
+        if (docID >= offsets.size() || !contentFile.is_open()) {
+            return "";
+        }
+        
+        const DocOffset& doc = offsets[docID];
+        
+        // Seek to document position
+        contentFile.seekg(doc.offset);
+        
+        // Read specified length
+        std::string content(doc.length, '\0');
+        contentFile.read(&content[0], doc.length);
+        
+        return content;
+    }
+    
+    // Batch get (optimization: sort by offset and read sequentially)
+    std::unordered_map<uint32_t, std::string> getBatch(const std::vector<uint32_t>& docIDs) const {
+        std::unordered_map<uint32_t, std::string> results;
+        
+        if (docIDs.empty() || !contentFile.is_open()) {
+            return results;
+        }
+        
+        // sort by offset (to minimize seeks)
+        std::vector<std::pair<uint32_t, DocOffset>> sorted;
+        sorted.reserve(docIDs.size());
+        
+        for (uint32_t docID : docIDs) {
+            if (docID < offsets.size()) {
+                sorted.push_back({docID, offsets[docID]});
+            }
+        }
+        
+        std::sort(sorted.begin(), sorted.end(), 
+                 [](const auto& a, const auto& b) {
+                     return a.second.offset < b.second.offset;
+                 });
+        
+        // read documents in sorted order
+        for (const auto& [docID, doc] : sorted) {
+            contentFile.seekg(doc.offset);
+            std::string content(doc.length, '\0');
+            contentFile.read(&content[0], doc.length);
+            results[docID] = content;
+        }
+        
+        return results;
+    }
+    
+    size_t size() const { return offsets.size(); }
+};
+
 
 #endif // INDEX_READER_HPP
 

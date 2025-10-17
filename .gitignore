@@ -1,12 +1,12 @@
-# 数据文件
+# data files
 data/
 output/
 index/
 
-# 可执行文件
+# executable files
 *.exe
 
-# 中间测试文件
+# test files
 test_*.tsv
 test_output/
 test_index/
@@ -15,5 +15,3 @@ test_index/
 # IDE
 .vscode/
 
-# 旧版中间文件
-intermediate_*.txt

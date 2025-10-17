@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <mutex>
 
-
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -32,24 +31,25 @@
 #include "querier.hpp"
 
 
-// 简单的HTTP服务器，处理搜索请求
+// HTTP Server
 class WebServer {
 private:
     int port;
     SOCKET serverSocket;
     
-    // 索引组件
+    // Index components
     Lexicon* lexicon;
     Stats* stats;
     DocLen* docLen;
     DocTable* docTable;
+    DocContentFile* docContent; 
     std::string indexDir;
     bm25::Params bm25Params;
 
     QueryEvaluator* evaluator;
     std::mutex evalMutex;
 
-    // URL解码
+    // URL Decode
     std::string urlDecode(const std::string& str) {
         std::string result;
         for (size_t i = 0; i < str.length(); i++) {
@@ -71,7 +71,7 @@ private:
         return result;
     }
     
-    // 从查询字符串中提取参数
+    // extract URL parameter
     std::string getParam(const std::string& queryString, const std::string& key) {
         size_t pos = queryString.find(key + "=");
         if (pos == std::string::npos) return "";
@@ -84,41 +84,8 @@ private:
         return urlDecode(queryString.substr(pos, endPos - pos));
     }
 
-    
-    // 生成JSON响应
-    std::string generateJsonResponse(const std::vector<QueryResult>& results, 
-                                    const std::vector<std::string>& queryTerms,
-                                    long long queryTime) {
-        std::ostringstream json;
-        json << "{\n";
-        json << "  \"query_terms\": [";
-        for (size_t i = 0; i < queryTerms.size(); i++) {
-            if (i > 0) json << ", ";
-            json << "\"" << escapeJson(queryTerms[i]) << "\"";
-        }
-        json << "],\n";
-        json << "  \"query_time_ms\": " << queryTime << ",\n";
-        json << "  \"num_results\": " << results.size() << ",\n";
-        json << "  \"results\": [\n";
-        
-        for (size_t i = 0; i < results.size(); i++) {
-            if (i > 0) json << ",\n";
-            json << "    {\n";
-            json << "      \"rank\": " << (i + 1) << ",\n";
-            json << "      \"docID\": " << results[i].docID << ",\n";
-            json << "      \"score\": " << results[i].score << ",\n";
-            json << "      \"original_id\": \"" << escapeJson(docTable->originalID(results[i].docID)) << "\",\n";
-            json << "      \"name\": \"" << escapeJson(docTable->name(results[i].docID)) << "\"\n";
-            json << "    }";
-        }
-        
-        json << "\n  ]\n";
-        json << "}";
-        
-        return json.str();
-    }
-
-     std::string escapeJson(const std::string& str) {
+    // Escape JSON special characters
+    std::string escapeJson(const std::string& str) {
         std::ostringstream escaped;
         for (char c : str) {
             switch (c) {
@@ -139,8 +106,62 @@ private:
         }
         return escaped.str();
     }
-    
-    // 读取静态文件
+
+    // generate JSON response
+    std::string generateJsonResponse(const std::vector<QueryResult>& results, 
+                                    const std::vector<std::string>& queryTerms,
+                                    long long queryTime) {
+        std::ostringstream json;
+        json << "{\n";
+        json << "  \"query_terms\": [";
+        for (size_t i = 0; i < queryTerms.size(); i++) {
+            if (i > 0) json << ", ";
+            json << "\"" << escapeJson(queryTerms[i]) << "\"";
+        }
+        json << "],\n";
+        json << "  \"query_time_ms\": " << queryTime << ",\n";
+        json << "  \"num_results\": " << results.size() << ",\n";
+        json << "  \"results\": [\n";
+        
+
+        // get document contents in batch
+        std::vector<uint32_t> docIDs;
+        for (const auto& r : results) {
+            docIDs.push_back(r.docID);
+        }
+        auto contents = docContent->getBatch(docIDs);
+        
+        for (size_t i = 0; i < results.size(); i++) {
+            if (i > 0) json << ",\n";
+            
+            uint32_t docID = results[i].docID;
+            
+            // generate query-dependent snippet
+            std::string snippet;
+            auto it = contents.find(docID);
+            if (it != contents.end() && !it->second.empty()) {
+                snippet = SnippetGenerator::generate(it->second, queryTerms);
+            } else {
+                snippet = "(No content available)";
+            }
+            
+            json << "    {\n";
+            json << "      \"rank\": " << (i + 1) << ",\n";
+            json << "      \"docID\": " << docID << ",\n";
+            json << "      \"score\": " << std::fixed << std::setprecision(4) << results[i].score << ",\n";
+            json << "      \"original_id\": \"" << escapeJson(docTable->originalID(docID)) << "\",\n";
+            json << "      \"snippet\": \"" << escapeJson(snippet) << "\"\n";
+            json << "    }";
+        }
+        
+        json << "\n  ]\n";
+        json << "}";
+        
+        return json.str();
+    }
+
+
+    // Read static file
     std::string readFile(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) return "";
@@ -150,7 +171,7 @@ private:
         return ss.str();
     }
     
-    // 获取内容类型
+    // Get content type based on file extension
     std::string getContentType(const std::string& path) {
         if (path.find(".html") != std::string::npos) return "text/html";
         if (path.find(".css") != std::string::npos) return "text/css";
@@ -159,7 +180,7 @@ private:
         return "text/plain";
     }
     
-    // 发送HTTP响应
+    // send HTTP response
     void sendResponse(SOCKET clientSocket, const std::string& status, 
                      const std::string& contentType, const std::string& body) {
         std::ostringstream response;
@@ -175,7 +196,7 @@ private:
         send(clientSocket, resp.c_str(), resp.length(), 0);
     }
     
-    // 处理客户端请求
+    // handle client connection
     void handleClient(SOCKET clientSocket) {
         char buffer[4096];
         int bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
@@ -188,7 +209,7 @@ private:
         buffer[bytesRead] = '\0';
         std::string request(buffer);
         
-        // 解析请求行
+        // parse request line
         size_t methodEnd = request.find(' ');
         size_t pathEnd = request.find(' ', methodEnd + 1);
         
@@ -201,7 +222,7 @@ private:
         std::string method = request.substr(0, methodEnd);
         std::string fullPath = request.substr(methodEnd + 1, pathEnd - methodEnd - 1);
         
-        // 分离路径和查询字符串
+        // split path and query string
         std::string path = fullPath;
         std::string queryString;
         size_t queryPos = fullPath.find('?');
@@ -212,7 +233,7 @@ private:
         
         std::cout << "Request: " << method << " " << path << std::endl;
         
-        // 路由处理
+        // route requests
         if (path == "/" || path == "/index.html") {
             std::string html = readFile("web/index.html");
             if (html.empty()) {
@@ -228,52 +249,36 @@ private:
                 sendResponse(clientSocket, "200 OK", "text/css", css);
             }
         } else if (path == "/search") {
-            // 处理搜索API
             std::string query = getParam(queryString, "q");
             std::string modeStr = getParam(queryString, "mode");
             std::string kStr = getParam(queryString, "k");
-
             std::string k1Str = getParam(queryString, "k1");
             std::string bStr = getParam(queryString, "b");
             
-            bool conjunctive = (modeStr == "and");
+            std::string mode = modeStr;
             int k = kStr.empty() ? 10 : std::stoi(kStr);
             double k1 = k1Str.empty() ? 0.9 : std::stod(k1Str);
             double b = bStr.empty() ? 0.4 : std::stod(bStr);
             auto startTime = std::chrono::high_resolution_clock::now();
             
-            // 分词
-            // std::vector<std::string> queryTerms = tokenize_words(query);
+            // tokenize query
             std::vector<std::string> tokens = tokenize_words(query);
             std::unordered_set<std::string> uniqueSet(tokens.begin(), tokens.end());
             std::vector<std::string> queryTerms(uniqueSet.begin(), uniqueSet.end());
 
-            // std::vector<std::string> queryTerms;
-            // std::unordered_set<std::string> seen;
-            // for (const auto& t : tokens) {
-            //     if (!seen.count(t)) { queryTerms.push_back(t); seen.insert(t); }
-            // }
-
-
-            // 执行查询
+            // execute query
             std::vector<QueryResult> results;
             {
                 std::lock_guard<std::mutex> lock(evalMutex);
-
-                evaluator->updateBM25Params(k1, b); // 更新参数
-
-                if (conjunctive) {
-                    results = evaluator->evaluateAND(queryTerms, k);
-                } else {
-                    results = evaluator->evaluateOR(queryTerms, k);
-                }
+                evaluator->updateBM25Params(k1, b);
+                results = evaluator->processQuery(queryTerms, mode, k);
             }
-            
+           
             auto endTime = std::chrono::high_resolution_clock::now();
             long long queryTime = std::chrono::duration_cast<std::chrono::milliseconds>(
                 endTime - startTime).count();
             
-            // 生成JSON响应
+            // generate JSON response
             std::string json = generateJsonResponse(results, queryTerms, queryTime);
             sendResponse(clientSocket, "200 OK", "application/json", json);
             
@@ -285,17 +290,17 @@ private:
     }
     
 public:
-    WebServer(int p, Lexicon* lex, Stats* st, DocLen* dl, DocTable* dt, 
+    WebServer(int p, Lexicon* lex, Stats* st, DocLen* dl, DocTable* dt, DocContentFile* dc,
               const std::string& idxDir, bm25::Params params)
         : port(p), serverSocket(INVALID_SOCKET), 
-          lexicon(lex), stats(st), docLen(dl), docTable(dt),
+          lexicon(lex), stats(st), docLen(dl), docTable(dt), docContent(dc),
           indexDir(idxDir), bm25Params(params), evaluator(nullptr) {
         
 #ifdef _WIN32
         WSADATA wsaData;
         WSAStartup(MAKEWORD(2, 2), &wsaData);
 #endif
-evaluator = new QueryEvaluator(*lexicon, *stats, *docLen, *docTable, indexDir, params);
+evaluator = new QueryEvaluator(*lexicon, *stats, *docLen, *docTable, *docContent, indexDir, params);
     }
     
     ~WebServer() {
@@ -318,7 +323,7 @@ evaluator = new QueryEvaluator(*lexicon, *stats, *docLen, *docTable, indexDir, p
             return false;
         }
         
-        // 允许地址重用
+        // allow address reuse
         int opt = 1;
         setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, 
                   (char*)&opt, sizeof(opt));
@@ -341,7 +346,7 @@ evaluator = new QueryEvaluator(*lexicon, *stats, *docLen, *docTable, indexDir, p
         std::cout << "Web server started at http://localhost:" << port << std::endl;
         std::cout << "Press Ctrl+C to stop" << std::endl;
         
-        // 接受连接
+        // connection loop
         while (true) {
             sockaddr_in clientAddr;
             socklen_t clientLen = sizeof(clientAddr);
@@ -351,7 +356,7 @@ evaluator = new QueryEvaluator(*lexicon, *stats, *docLen, *docTable, indexDir, p
                 continue;
             }
             
-            // 在新线程中处理客户端
+            // handle client in a new thread
             std::thread clientThread(&WebServer::handleClient, this, clientSocket);
             clientThread.detach();
         }
@@ -373,7 +378,7 @@ int main(int argc, char* argv[]) {
     
     std::cout << "Loading index..." << std::endl;
     
-    // 加载索引
+    // ---- Load index components ----
     Lexicon lexicon;
     if (!lexicon.load(indexDir + "/lexicon.tsv")) {
         return 1;
@@ -394,11 +399,28 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
+    // ---- Load document content ----
+    DocContentFile docContent;
+    std::string offsetPath = docTablePath;
+    std::string contentPath = docTablePath;
+    size_t lastSlash = offsetPath.find_last_of("/\\");
+    if (lastSlash != std::string::npos) {
+        offsetPath = offsetPath.substr(0, lastSlash + 1) + "doc_offset.bin";
+        contentPath = contentPath.substr(0, lastSlash + 1) + "doc_content.bin";
+    } else {
+        offsetPath = "doc_offset.bin";
+        contentPath = "doc_content.bin";
+    }
+    
+    if (!docContent.load(offsetPath, contentPath)) {
+        std::cerr << "Warning: Could not load document content, snippets will be unavailable" << std::endl;
+    }
+
     std::cout << "Index loaded successfully!" << std::endl;
     
-    // 启动Web服务器
+    // start web server
     bm25::Params bm25Params(0.9, 0.4);
-    WebServer server(port, &lexicon, &stats, &docLen, &docTable, indexDir, bm25Params);
+    WebServer server(port, &lexicon, &stats, &docLen, &docTable, &docContent, indexDir, bm25Params);
     
     if (!server.start()) {
         return 1;

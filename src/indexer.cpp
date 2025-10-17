@@ -48,6 +48,8 @@ private:
     
     // 文档表文件
     std::ofstream docTableFile;
+    std::ofstream docContentFile;
+    std::ofstream docOffsetFile;     // docID -> (offset, length)
     
     // 扁平 posting 输出文件（分片滚动写）
     std::ofstream postingsOut;
@@ -91,8 +93,18 @@ public:
         fs::create_directories(outputDir);
         
         // 打开文档表文件
-        docTableFile.open(outputDir + "/doc_table.txt", std::ios::out | std::ios::binary);
-        if (!docTableFile.is_open()) {
+        docTableFile.open(outputDir + "/doc_table.txt", std::ios::out);
+        
+        // 文档内容：追加所有文档内容
+        docContentFile.open(outputDir + "/doc_content.bin", 
+                           std::ios::out | std::ios::binary);
+        
+        // 偏移量表：docID -> (offset, length)
+        docOffsetFile.open(outputDir + "/doc_offset.bin", 
+                          std::ios::out | std::ios::binary);
+        
+        if (!docTableFile.is_open() || !docContentFile.is_open() || 
+            !docOffsetFile.is_open()) {
             std::cerr << "Failed to open doc_table.txt" << std::endl;
             exit(1);
         }
@@ -105,6 +117,8 @@ public:
         if (docTableFile.is_open()) {
             docTableFile.close();
         }
+        if (docContentFile.is_open()) docContentFile.close();
+        if (docOffsetFile.is_open()) docOffsetFile.close();
         if (postingsOut.is_open()) {
             postingsOut.close();
         }
@@ -112,10 +126,33 @@ public:
    
     // 解析单个文档
     void parseDocument(const std::string& docName, const std::string& content) {
-        // 记录文档ID和文档名的映射
-        // 格式：internalDocID \t originalDocID \t passage_snippet
-        std::string snippet = makeSnippet(content, 60);
-        docTableFile << currentDocID << "\t" << docName << "\t" << snippet << "\n";
+        // // 记录文档ID和文档名的映射
+        // // 格式：internalDocID \t originalDocID \t passage_snippet
+        // std::string snippet = makeSnippet(content, 60);
+        // docTableFile << currentDocID << "\t" << docName << "\t" << snippet << "\n";
+        
+         // 1. 文档表：docID -> originalID
+        docTableFile << currentDocID << "\t" << docName << "\n";
+        
+        // 2. 写入文档内容并记录偏移量
+        uint64_t offset = docContentFile.tellp();  // 当前写位置
+        
+        // 清理内容（去除 tab 和换行符，保持单行便于处理）
+        std::string cleanContent = content;
+        std::replace(cleanContent.begin(), cleanContent.end(), '\t', ' ');
+        std::replace(cleanContent.begin(), cleanContent.end(), '\n', ' ');
+        std::replace(cleanContent.begin(), cleanContent.end(), '\r', ' ');
+        
+        // 写入内容（带换行符作为分隔）
+        docContentFile << cleanContent << "\n";
+        
+        uint64_t afterOffset = docContentFile.tellp();
+        uint32_t length = static_cast<uint32_t>(afterOffset - offset - 1);  // 减去换行符
+        
+        // 3. 写入偏移量信息：offset (8 bytes) + length (4 bytes)
+        docOffsetFile.write(reinterpret_cast<const char*>(&offset), sizeof(uint64_t));
+        docOffsetFile.write(reinterpret_cast<const char*>(&length), sizeof(uint32_t));
+        
         
         // 统计当前文档中每个term的频率
         std::unordered_map<std::string, uint32_t> termFreq;

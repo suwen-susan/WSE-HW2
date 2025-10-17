@@ -1,4 +1,5 @@
-#pragma once
+#ifndef UTILS_HPP
+#define UTILS_HPP
 
 #include <string>
 #include <vector>
@@ -6,8 +7,12 @@
 #include <algorithm>
 #include <cctype>
 
-// 文本预处理：非字母数字统一视为分隔符；转小写；不做词干化
-// 符合课程建议：'-', ':', '.', ',', '(', ')', 等都是分隔符
+/**
+ * @brief Normalize text by converting to lowercase and replacing non-alphanumeric characters with spaces.
+ * 
+ * @param text Input text.
+ * @return Normalized text.
+*/
 inline std::string normalize(const std::string& text) {
     std::string result;
     result.reserve(text.size());
@@ -22,22 +27,28 @@ inline std::string normalize(const std::string& text) {
         if (std::isalnum(uc)) {
             result.push_back(std::tolower(uc));
         } else {
-            // 任何非字母数字字符都是分隔符
+            // Replace non-alphanumeric with space
             push_space();
         }
     }
     return result;
 }
 
-// 分词：保留所有词（包括数字、单字符、停用词）
-// 符合课程建议：不过滤停用词、保留数字词如 "2"、"7up"、"smith007"
+/**
+ * @brief Split a string into tokens using whitespace and punctuation.
+ * 
+ * @param text The input text.
+ * @return Vector of tokens (words).
+*/
 inline std::vector<std::string> tokenize_words(const std::string& text) {
     std::vector<std::string> tokens;
     std::stringstream ss(normalize(text));
     std::string token;
     while (ss >> token) {
-        // 不做任何过滤，保留所有分割出的词
+        // keep all tokens
         tokens.push_back(token);
     }
     return tokens;
 }
+
+#endif // UTILS_HPP
