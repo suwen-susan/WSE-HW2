@@ -21,19 +21,6 @@ struct TermMeta {
     TermMeta() : df(0), cf(0), docids_offset(0), freqs_offset(0), blocks(0) {}
 };
 
-/**
- * @brief Metadata entry for a single term in the lexicon.
- * 
- * Each entry records where this term’s posting list is stored in
- * the index files, how many documents contain it, and its total term frequency.
- */
-struct LexiconEntry {
-    uint64_t docids_offset;   // Byte offset of docIDs list in postings.docids.bin
-    uint64_t freqs_offset;    // Byte offset of term frequencies list
-    uint32_t df;              // Number of documents containing the term
-    uint64_t total_tf;        // Total occurrences of this term in the corpus
-};
-
 // Lexicon: term -> TermMeta
 class Lexicon {
 private:

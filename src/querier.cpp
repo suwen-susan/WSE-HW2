@@ -160,11 +160,11 @@ int main(int argc, char* argv[]) {
             if (i > 0) std::cout << ", ";
             std::cout << queryTerms[i];
         }
-        std::cout << " (" << mode << " mode)" << std::endl;
+        std::cout << " (" << localMode << " mode)" << std::endl;
         
         // Evaluate query
         
-        std::vector<QueryResult> results = evaluator.processQuery(queryTerms, mode, defaultK);
+        std::vector<QueryResult> results = evaluator.processQuery(queryTerms, localMode, defaultK);
 
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
